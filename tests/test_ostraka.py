@@ -39,7 +39,8 @@ def chapter():
 
 @pytest.fixture
 def no_keys(monkeypatch):
-    for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OSTRAKA_API_KEY", "OSTRAKA_PROVIDER", "OSTRAKA_MODEL", "OSTRAKA_BASE_URL"):
+    monkeypatch.setattr("ostraka.providers.shutil.which", lambda *args: None)
+    for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OSTRAKA_API_KEY", "OSTRAKA_PROVIDER", "OSTRAKA_MODEL", "OSTRAKA_BASE_URL", "OSTRAKA_CODEX_BIN"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -205,7 +206,7 @@ def test_invalid_output_and_error_redaction():
 
 
 def test_provider_selection(no_keys, monkeypatch):
-    with pytest.raises(GenerationError, match="No model key"):
+    with pytest.raises(GenerationError, match="No model connected"):
         configuration()
     monkeypatch.setenv("GEMINI_API_KEY", "fixture")
     assert configuration().name == "gemini"
@@ -223,3 +224,73 @@ def test_restart_marks_jobs_failed(tmp_path):
     store.save("jobs", {"id": "job", "status": "running"}, "paper")
     store = Store(tmp_path)
     assert store.get("jobs", "job")["status"] == "failed"
+
+
+def test_formatted_reader_sanitizes_and_preserves_structure():
+    from ostraka.reader import prepare_html
+    raw = '''<article class="ltx_document"><h1>Paper</h1><h2 id="S1">Method</h2>
+    <p class="ltx_p" onclick="bad()">A <em>formatted</em> passage with <math><mi>x</mi><mo>+</mo><mn>1</mn></math>.</p>
+    <script>steal()</script><iframe src="https://evil.test"></iframe>
+    <img src="2312.06681v4/figure.png" onerror="bad()"><img src="https://evil.test/track.png">
+    <object type="image/svg+xml" data="2312.06681v4/diagram.svg"></object>
+    <a href="javascript:bad()">bad</a><table><tr><td>Evidence</td></tr></table></article>'''
+    reader, assets = prepare_html(raw, 'paperid', 'https://arxiv.org/html/2312.06681')
+    assert '<math>' in reader['html'] and '<table>' in reader['html']
+    assert 'reader-block' in reader['html'] and 'data-anchor="passage-0"' in reader['html']
+    assert all(x not in reader['html'] for x in ('onclick', 'onerror', '<script', '<iframe', 'javascript:', 'https://evil.test'))
+    assert len(assets) == 2
+    assert reader['passages'][0]['text'] == 'A formatted passage with x+1.'
+    assert reader['contents'][1]['title'] == 'Method'
+
+
+def test_html_annotations_validate_against_passages(tmp_path, no_keys):
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        paper = upload(client)
+        paper['reader'] = {'html': '<p>Useful text</p>', 'passages': [{'anchor': 'passage-0', 'text': 'Useful text'}], 'contents': []}
+        app.state.store.save('papers', paper)
+        data = {'page': 1, 'anchor': 'passage-0', 'start': 0, 'end': 6, 'quote': 'Useful', 'note': 'Remember'}
+        result = client.post(f"/api/papers/{paper['id']}/annotations", json=data, headers=HEADERS)
+        assert result.status_code == 200
+        assert result.json()['anchor'] == 'passage-0'
+        data['quote'] = 'Forged'
+        assert client.post(f"/api/papers/{paper['id']}/annotations", json=data, headers=HEADERS).status_code == 400
+        assert "frame-ancestors 'self'" in client.get(f"/api/papers/{paper['id']}/pdf").headers['content-security-policy']
+
+
+def test_codex_subscription_configuration(no_keys, monkeypatch):
+    import subprocess
+    monkeypatch.setenv('OSTRAKA_PROVIDER', 'codex')
+    with pytest.raises(GenerationError, match='Install the official Codex CLI'):
+        configuration()
+    monkeypatch.setattr('ostraka.providers.shutil.which', lambda *args: '/usr/local/bin/codex')
+    monkeypatch.setattr('ostraka.providers.subprocess.run', lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, '', 'Logged in using ChatGPT'))
+    assert configuration().public()['configured'] is True
+    assert configuration().name == 'codex'
+    monkeypatch.setattr('ostraka.providers.subprocess.run', lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, '', 'Logged in using an API key'))
+    with pytest.raises(GenerationError, match='must be signed in with ChatGPT'):
+        configuration()
+
+
+def test_codex_uses_cli_without_api_fallback(no_keys, monkeypatch, chapter):
+    from pathlib import Path
+    from ostraka.providers import codex_request
+    monkeypatch.setenv('OPENAI_API_KEY', 'must-not-be-forwarded')
+    monkeypatch.setenv('CODEX_API_KEY', 'must-not-be-forwarded')
+    captured = {}
+    class Process:
+        returncode = 0
+        async def communicate(self, content):
+            assert b'UNTRUSTED' in content
+            Path(captured['args'][captured['args'].index('--output-last-message')+1]).write_text(json.dumps(chapter))
+    async def spawn(*args, **kwargs):
+        captured.update(args=args, kwargs=kwargs)
+        return Process()
+    monkeypatch.setattr('ostraka.providers.asyncio.create_subprocess_exec', spawn)
+    raw = asyncio.run(codex_request(Provider('codex', 'fixture-model', '', '/fake/codex'), 'system', 'UNTRUSTED source'))
+    assert json.loads(raw) == chapter
+    assert 'OPENAI_API_KEY' not in captured['kwargs']['env']
+    assert 'CODEX_API_KEY' not in captured['kwargs']['env']
+    assert 'forced_login_method="chatgpt"' in captured['args']
+    assert 'read-only' in captured['args'] and 'shell_tool' in captured['args']
+    assert '--ignore-user-config' in captured['args']

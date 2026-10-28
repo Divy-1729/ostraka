@@ -38,6 +38,7 @@ class Deck(BaseModel):
 
 
 class Annotation(BaseModel):
+    anchor: str | None = Field(default=None, pattern=r"^passage-\d+$")
     page: int = Field(ge=1)
     start: int = Field(ge=0)
     end: int = Field(ge=0)

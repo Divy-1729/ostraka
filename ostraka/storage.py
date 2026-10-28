@@ -1,4 +1,5 @@
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
@@ -66,3 +67,4 @@ class Store:
                 db.execute(f"DELETE FROM {table} WHERE paper_id=?", (item_id,))
             db.execute("DELETE FROM papers WHERE id=?", (item_id,))
         (self.root / f"{item_id}.pdf").unlink(missing_ok=True)
+        shutil.rmtree(self.root / f"{item_id}-assets", ignore_errors=True)

@@ -16,6 +16,7 @@ from . import providers
 from .models import Annotation, Chapter, Deck, PresentationRequest
 from .papers import MAX_BYTES, chunks, download_arxiv, extract_pdf
 from .storage import Store, now
+from .reader import import_reader
 
 STATIC = Path(__file__).parent / "static"
 
@@ -57,7 +58,7 @@ def create_app(data_dir=None):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        response.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
         return response
 
     @app.exception_handler(providers.GenerationError)
@@ -146,8 +147,21 @@ UNTRUSTED EVIDENCE:\n{json.dumps(evidence)}\nEND EVIDENCE"""
         paper = await run_in_threadpool(extract_pdf, content, filename)
         for existing in app.state.store.list("papers"):
             if existing["sha256"] == paper["sha256"]:
+                if source and not active_job(existing["id"]):
+                    existing["source"] = source
+                    if not existing.get("reader"):
+                        try:
+                            existing["reader"] = await import_reader(existing, app.state.store)
+                        except Exception:
+                            pass
+                    app.state.store.save("papers", existing)
                 return {"paper": existing, "duplicate": True}
         paper.update(id=uuid.uuid4().hex, source=source, created_at=now(), guide=[], guide_complete=False, deck=None)
+        if source:
+            try:
+                paper["reader"] = await import_reader(paper, app.state.store)
+            except Exception:
+                paper["reader_unavailable"] = True
         path = app.state.store.root / f"{paper['id']}.pdf"
         path.write_bytes(content)
         app.state.store.save("papers", paper)
@@ -197,10 +211,35 @@ UNTRUSTED EVIDENCE:\n{json.dumps(evidence)}\nEND EVIDENCE"""
         paper = paper_or_404(paper_id)
         return {**paper, "annotations": app.state.store.list("annotations", paper_id), "jobs": app.state.store.list("jobs", paper_id)}
 
+    @app.post("/api/papers/{paper_id}/reader")
+    async def restore_reader(paper_id: str):
+        paper = paper_or_404(paper_id)
+        if not paper.get("source"):
+            raise HTTPException(400, "This is a PDF upload. Use the original PDF view for its exact layout.")
+        if active_job(paper_id):
+            raise HTTPException(409, "Wait for generation to finish before restoring the formatted reader.")
+        try:
+            paper["reader"] = await import_reader(paper, app.state.store)
+        except Exception:
+            raise HTTPException(400, "No HTML version could be imported. The original PDF view preserves its layout.") from None
+        app.state.store.save("papers", paper)
+        return {"ok": True}
+
+    @app.get("/api/papers/{paper_id}/assets/{name}")
+    def reader_asset(paper_id: str, name: str):
+        import re
+        paper_or_404(paper_id)
+        if not re.fullmatch(r"[a-f0-9]{24}\.(png|jpg|jpeg|gif|webp|svg)", name):
+            raise HTTPException(404, "Figure not found.")
+        path = app.state.store.root / f"{paper_id}-assets" / name
+        if not path.is_file():
+            raise HTTPException(404, "Figure not found.")
+        return FileResponse(path, headers={"Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'"})
+
     @app.get("/api/papers/{paper_id}/pdf")
     def original_pdf(paper_id: str):
         paper_or_404(paper_id)
-        return FileResponse(app.state.store.root / f"{paper_id}.pdf", media_type="application/pdf", headers={"Content-Disposition": 'inline; filename="paper.pdf"'})
+        return FileResponse(app.state.store.root / f"{paper_id}.pdf", media_type="application/pdf", headers={"Content-Disposition": 'inline; filename="paper.pdf"', "Content-Security-Policy": "default-src 'none'; frame-ancestors 'self'"})
 
     @app.delete("/api/papers/{paper_id}")
     def delete_paper(paper_id: str):
@@ -230,7 +269,13 @@ UNTRUSTED EVIDENCE:\n{json.dumps(evidence)}\nEND EVIDENCE"""
         paper = paper_or_404(paper_id)
         if body.page > len(paper["pages"]):
             raise HTTPException(400, "Invalid page.")
-        text = paper["pages"][body.page - 1]["text"]
+        if body.anchor:
+            passage = next((p for p in paper.get("reader", {}).get("passages", []) if p["anchor"] == body.anchor), None)
+            if not passage:
+                raise HTTPException(400, "Paper passage not found.")
+            text = passage["text"]
+        else:
+            text = paper["pages"][body.page - 1]["text"]
         if body.end > len(text) or body.start >= body.end or text[body.start:body.end] != body.quote:
             raise HTTPException(400, "Highlight does not match the source text. Select it again.")
         annotation = {**body.model_dump(), "id": uuid.uuid4().hex, "created_at": now()}
@@ -267,7 +312,7 @@ UNTRUSTED EVIDENCE:\n{json.dumps(evidence)}\nEND EVIDENCE"""
         paper = paper_or_404(paper_id)
         lines = [f"# {paper['title']}", "", paper["source"], ""]
         for note in app.state.store.list("annotations", paper_id):
-            lines.extend([f"## PDF page {note['page']}", "", "> " + note["quote"].replace("\n", "\n> "), "", note["note"], ""])
+            lines.extend([("## Paper passage" if note.get("anchor") else f"## PDF page {note['page']}"), "", "> " + note["quote"].replace("\n", "\n> "), "", note["note"], ""])
         return Response("\n".join(lines), media_type="text/markdown", headers={"Content-Disposition": 'attachment; filename="ostraka-notes.md"'})
 
     @app.get("/api/papers/{paper_id}/deck.html")
